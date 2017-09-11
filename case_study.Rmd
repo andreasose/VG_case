@@ -20,6 +20,9 @@ editor_options:
 library(tidyverse)
 library(lubridate)
 library(gbm)
+library(GGally)
+library(gridExtra)
+ggpairs(iris, aes(colour = Species, alpha = 0.4))
 ```
 
 ## Exploratory analysis
@@ -28,35 +31,204 @@ case <- read_csv2("bank-full.csv")
 case_sample <- read_csv2("bank.csv")
 glimpse(case)
 ```
-merk at ukjente verdier enten er kodet som -1, eller som "unknown". Burde ryddes til NA for bedre prossesering. 
 
-Hvorfor valgte man disse variablene? På alle tallene burde man iallefall kanskje gjort en PCA?
+Førsteinntrykk:
 
-## summarise the data
+- For pdays, så ser manglende verdier å være kodet som -1, mens for contact og poutcome så ser det ut til å være koded med "unknown". Må sjekke senere om det er andre kolonner som også har missing values.
 
+
+- Hvorfor valgte man akkurat disse variablene? Rapporten sier de prøvde å se på det visuelt via grafer. På alle tallene burde man iallefall kanskje gjort en PCA?
+
+- Før jeg begynner å lage modeller, så er det en god ide å grafe opp distribusjonene og kategorisvar. 
+
+```{r}
+ggpairs(case_sample, aes(alpha = 0.4))
+```
+
+
+## Visuell inspeksjon av dataene
+Starter med å se på distribusjonen av de numeriske kolonnene
 ```{r create_count_plots}
 
 int_columns <- case %>% select_if(is.integer) %>% colnames() 
-chr_columns <- case %>% select_if(is.character) %>% colnames()
 
 int_histograms <- int_columns %>% map(function(x) 
     ggplot(case) + geom_histogram(aes_string(x))) 
-chr_bars <- chr_columns %>% map(function(x)
-    ggplot(case) + geom_bar(aes_string(x)) + coord_flip()) 
 
 grid.arrange(grobs = int_histograms)
-grid.arrange(grobs = chr_bars)
+
 
 ```
 
-Noen tanker basert på grafene:
+Noen førsteinntrykk:
 
- - flere av tall-kolonnene (balance, duration, campaign, pdays, previous) har outliers
- - poutcome mangler mye data
- - "unknown" og -1 burde rekodes til NA
- - Drit i rminer, gå til source-pakkene
+ - ggplot sine histogrammer er så stygge..
+ - flere av tall-kolonnene (balance, duration, campaign, pdays, previous) har outliers. Gjør det vanskelig å se tegninga. Bør ryddes unna, vil påvirke resultatene senere i modelleringsfasen.
+ - age virker relativt normalt fordelt, noe positiv skew.
+ - 
+ - Previous og pdays virker som det er nesten bare 0 eller -1. Det betyr at de aller fleste har blitt cold-callet; påvirker nok negativt på responsen. Blir lettere å se etter litt flere nøyaktige grafer.
+```{r map_out_outliers}
+
+# Burde lage en map-funksjon for outliers som gjør ca:
+# case %>% 
+#     group_by(pdays) %>%
+#     summarise(antall = n()) %>%
+#     mutate(prosent = antall/sum(antall)) %>%
+#     filter(prosent > 0.001)
+
+int_columns %>%
+    map(
+        function(x)
+         case %>%
+            group_by_at(.vars = x)  %>%
+            summarise(antall = n()) %>%
+            mutate(prosent = antall/sum(antall)) %>%
+            filter(prosent > 0.001) %>%
+        ggplot(.) + geom_bar(aes_string(x, "antall"), stat = "identity")
+        ) %>%
+    grid.arrange(grobs = .)
+# Pipe og map er heite greier
+
+```
+Fra venstre til høyre:
+- Alder konsentrert rundt ca 35 år.
+- De aller fleste har 0 på konto? Fordi de ikke er eksisterende kunder?
+- ser ut som noe syklisk skjer på dag, men vanskelig å si noe om uten å vite måned/år. Testen gikk over flere år, så det er uansett ikke noe som er lett å undersøke siden vi mangler en kolonne for år.
+- litt bimodalitet på hvor lang samtalen tok. Kan indikere at enkelte fort la på hvis de ikke var interesserte. Grafene burde fargekodes med outcome-variablen y.
+- De fleste ble bare kontaktet 1 gang.
+- pdays har nesten bare -1, som var NA. Burde droppes istedenfor siden modellene sikkert vil kreve complete data.
+- previous viser fortsatt at nesten alle har blitt cold-callet. Burde fargekodes for å se hva folk svarte på y.
+
+Fargekoder noen av grafene for å se om det er noen spesiell trend prosentvis.
+
+```{r}
+int_columns %>%
+    map(
+        function(x)
+         case %>%
+            group_by_at(.vars = c(x, "y"))  %>%
+            summarise(antall = n()) %>%
+            mutate(prosent = antall/sum(antall)) %>%
+            filter(prosent > 0.001) %>%
+        ggplot(., aes(fill = y)) + geom_bar(aes_string(x, "antall"), stat = "identity") 
+        ) %>%
+    grid.arrange(grobs = .)
+```
+
+- lite data, men ser ut som om eldre responderer meget positivt.
+- antallet som sier ja er stabilt uavhengig av dag i måneden.
+- duration er viktig, de må holde vedkommende på telefonen en stund.
+
+Vi tester siste ved å se prosentvis, dropper også å se på pdays:
+
+```{r}
+int_columns[-6] %>%
+    map(
+        function(x)
+         case %>%
+            group_by_at(.vars = c(x, "y"))  %>%
+            summarise(antall = n()) %>%
+            mutate(prosent = antall/sum(antall)) %>%
+        ggplot(., aes(fill = y)) + geom_bar(aes_string(x, "prosent"), stat = "identity") 
+        ) %>%
+    grid.arrange(grobs = .)
+```
+
+- Eldre mer positive
+- Grafen til balanse er ikke så lett å lese; om jeg hadde hatt tid så hadde jeg zoomet inn på denne
+- dag er stabil.
+- jo lengre kundesenteret snakker, desto større sjanse for konvertering. *viktig* når vi skal snakke med marked
+- Etter et lengre antall kontaktpunkter, så lønner det seg ikke lengre å ringe. Smartere å bruke resurssene andre steder.
+- Litt kontakt med kunden tidligere er positivt. Grafen burde zoomes ut.
+
+Ville vanligvis zoomet inn på de grafene som så litt stygge ut, men vi må videre.
+```{r}
+# case$bins <-  cut(case$balance, 10)
+case %>% filter(balance < 25000) %>%
+    mutate(bins = cut(balance, 10)) %>%
+    group_by(bins, y) %>%
+    summarise(antall = n()) %>%
+    mutate(prosent = antall/sum(antall)) %>%
+    ggplot(aes(bins, prosent, fill = y)) + geom_bar(stat= "identity") 
+```
+
+### kategoriske kolonner
+
+```{r}
+chr_columns <- case %>% select_if(is.character) %>% colnames()
+chr_bars <- chr_columns %>% map(function(x)
+    ggplot(case) + geom_bar(aes_string(x)) + coord_flip()) 
+grid.arrange(grobs = chr_bars)
+
+```
+ Noen tanker basert på grafene:
+ - poutcome mangler mye data ("unknown")
+ - variabelen som skal predikeres (y) er sterkt ubalansert; de fleste har takket nei:
+ - De fleste har ikke forbrukslån
+ - Få defaults/konkurser
  
+Burde grafe kolonnene med y som farge for å se om det er noe spesielt der. Gjør det i absolutte tall og prosentvis:
+
+```{r}
+chr_columns %>%
+    map(
+        function(x)
+         case %>%
+            group_by_at(.vars = c(x, "y"))  %>%
+            summarise(antall = n()) %>%
+            mutate(prosent = antall/sum(antall)) %>%
+        ggplot(., aes(fill = y)) + 
+            geom_bar(aes_string(x, "antall"), stat = "identity") +
+            coord_flip()
+        ) %>%
+    grid.arrange(grobs = .)
+# copy paste, endre til prosent
+chr_columns %>%
+    map(
+        function(x)
+         case %>%
+            group_by_at(.vars = c(x, "y"))  %>%
+            summarise(antall = n()) %>%
+            mutate(prosent = antall/sum(antall)) %>%
+        ggplot(., aes(fill = y)) + 
+            geom_bar(aes_string(x, "prosent"), stat = "identity") +
+            coord_flip()
+        ) %>%
+    grid.arrange(grobs = .)
+```
+- Eneste som står ut er om kundesenteret har hatt suksess med en tidligere kampanje, så er denne også en suksess. *Men*, her er det så mye missing data at det er vanskelig å si noe konkret. 
+
+Burde sortere måned skikkelig for å se om det finnes sesongtrender:
+
+```{r}
+case$month <- factor(case$month, 
+                     levels = c("jan", "feb", "mar", "apr",
+                                "may", "jun", "jul", "aug",
+                                "sep", "oct", "nov", "dec"))
+p <- case %>% 
+    group_by(month, y) %>%
+    summarise(antall = n()) %>%
+    mutate(prosent = antall/sum(antall)) %>%
+    ggplot(aes(month, antall)) + 
+    geom_bar(stat = "identity", aes(fill = y)) + 
+    ggtitle("Totalt")
+r <- case %>% 
+    group_by(month, y) %>%
+    summarise(antall = n()) %>%
+    mutate(prosent = antall/sum(antall)) %>%
+    ggplot(aes(month, prosent)) + 
+    geom_bar(stat = "identity", aes(fill = y)) + 
+    ggtitle("Prosent pr måned")
+grid.arrange(p, r)
+```
+
+- Synes egentlig antallet som svarer ja er jevnt over hele året stabilt. 
+
+
+## Data-behandling før modellering
+
 ```{r add_NA}
+# Legge til NA og omklassifiser y "yes" og "no" til 1 og 0
 case[case == -1] <- NA
 case[case == "unknown"] <- NA
 case$y <- if_else(case$y == "yes", 1, 0)
@@ -69,9 +241,6 @@ case$y <- as.integer(case$y)
 library(rminer) # load the library
 # read the data:
 D=read.table("bank.csv",sep=";",header=TRUE)
-AT=c(6,7,9:12,17:20,22:25,27,30,31,36,43:46,48:51,57,58,61,5)
-D=D[,AT] # select some attributes
-DF=na.omit(D) # remove missing data
 M=mining(y~.,DF,method=c("holdout",2/3),model="dt",Runs=20) # model several decision trees
 # plot the ROC curve
 mgraph(M,graph="ROC",Grid=10,baseline=TRUE)
