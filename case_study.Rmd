@@ -87,7 +87,7 @@ int_columns %>%
         ggplot(.) + geom_bar(aes_string(x, "antall"), stat = "identity")
         ) %>%
     grid.arrange(grobs = .)
-# Pipe og map er heite greier
+
 
 ```
 Fra venstre til høyre:
